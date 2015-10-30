@@ -1,7 +1,26 @@
 (function() {
   var out$ = typeof exports != 'undefined' && exports || this;
 
-  var doctype = '<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">';
+  var doctype = '<?xml version="1.0" standalone="no"?>' +
+    '<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">';
+
+  // We will use these to extract filename and extensions from `src: url(...)`
+  // @font-face declarations
+  var fontFaceUrlPattern = /url\((.*?)\)/g;
+
+  // get file extension via @http://stackoverflow.com/a/190878/1195417
+  function getFileExtension(filename) {
+    return (/[.]/.exec(filename)) ? /[^.]+$/.exec(filename) : undefined;
+  }
+
+  // Mime types for fonts
+  var types = {
+    eot: 'application/vnd.ms-fontobject',
+    ttf: 'application/octet-stream',
+    svg: 'image/svg+xml',
+    woff: 'application/font-woff',
+    woff2: 'application/font-woff2'
+  };
 
   // We will use these to extract filename and extensions from `src: url(...)`
   // @font-face declarations
@@ -17,7 +36,86 @@
   };
 
   function isExternal(url) {
-    return url && url.lastIndexOf('http',0) == 0 && url.lastIndexOf(window.location.host) == -1;
+    return url && url.lastIndexOf('http',0) === 0 && url.lastIndexOf(window.location.host) == -1;
+  }
+
+  // Look up mime type based on extension
+  function mimeType(ext) {
+    return types[ext] || 'application/octet-stream';
+  }
+
+  // Return a binary representation of a font
+  function getBinary(url) {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', url, false);
+    xhr.overrideMimeType('text\/plain; charset=x-user-defined');
+    xhr.send(null);
+    if (xhr.status !== 404) {
+      return xhr.responseText;
+    } else {
+      return null;
+    }
+  }
+
+  // Encode binary string as base64
+  // See https://gist.github.com/viljamis/c4016ff88745a0846b94
+  // and http://stackoverflow.com/questions/7370943/retrieving-binary-file-content-using-javascript-base64-encode-it-and-reverse-de
+  function base64Encode(str) {
+    var CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    var out = '';
+    var i = 0;
+    var len = str.length;
+    var c1;
+    var c2;
+    var c3;
+    while (i < len) {
+      /*jslint bitwise: true */
+      c1 = str.charCodeAt(i++) & 0xff;
+      if (i == len) {
+        out += CHARS.charAt(c1 >> 2);
+        out += CHARS.charAt((c1 & 0x3) << 4);
+        out += '==';
+        break;
+      }
+      c2 = str.charCodeAt(i++);
+      if (i == len) {
+        out += CHARS.charAt(c1 >> 2);
+        out += CHARS.charAt(((c1 & 0x3) << 4) | ((c2 & 0xF0) >> 4));
+        out += CHARS.charAt((c2 & 0xF) << 2);
+        out += '=';
+        break;
+      }
+      c3 = str.charCodeAt(i++);
+      out += CHARS.charAt(c1 >> 2);
+      out += CHARS.charAt(((c1 & 0x3) << 4) | ((c2 & 0xF0) >> 4));
+      out += CHARS.charAt(((c2 & 0xF) << 2) | ((c3 & 0xC0) >> 6));
+      out += CHARS.charAt(c3 & 0x3F);
+      /*jslint bitwise: false */
+    }
+    return out;
+  }
+
+  // Replace @font-face `src: url(...)` with a properly formatted base64 css rule
+  function inlineFont(rule, callback) {
+    var fontCssText = rule.cssText.replace(fontFaceUrlPattern, function(match, capture) {
+      var binary = getBinary(capture);
+      if (binary) {
+        var base64 = base64Encode(binary);
+        var ext = getFileExtension(capture)[1];
+        var urlStr = [
+          'data:' + mimeType(ext) + ';',
+          'charset=utf-8;',
+          'base64,' + base64
+        ].join('');
+
+        return 'url(' + urlStr + ')';
+      } else {
+        // if `getBinary` fails, (eg if XHR request 404s), return the original string
+        return match;
+      }
+    });
+
+    callback(fontCssText);
   }
 
   // Look up mime type based on extension
@@ -95,55 +193,77 @@
   function inlineImages(el, callback) {
     var images = el.querySelectorAll('image');
     var left = images.length;
-    if (left == 0) {
+    if (left === 0) {
       callback();
     }
+    function loadImages(image) {
+      var href = image.getAttribute('xlink:href');
+      if (href) {
+        if (isExternal(href.value)) {
+          console.warn('Cannot render embedded images linking to external hosts: ' + href.value);
+          return;
+        }
+      }
+      var canvas = document.createElement('canvas');
+      var ctx = canvas.getContext('2d');
+      var img = new Image();
+      href = href || image.getAttribute('href');
+      img.src = href;
+      img.onload = function() {
+        canvas.width = img.width;
+        canvas.height = img.height;
+        ctx.drawImage(img, 0, 0);
+        image.setAttribute('xlink:href', canvas.toDataURL('image/png'));
+        left--;
+        if (left === 0) {
+          callback();
+        }
+      };
+      img.onerror = function() {
+        console.log('Could not load ' + href);
+        left--;
+        if (left === 0) {
+          callback();
+        }
+      };
+    }
     for (var i = 0; i < images.length; i++) {
-      (function(image) {
-        var href = image.getAttributeNS("http://www.w3.org/1999/xlink", "href");
-        if (href) {
-          if (isExternal(href.value)) {
-            console.warn("Cannot render embedded images linking to external hosts: "+href.value);
-            return;
-          }
-        }
-        var canvas = document.createElement('canvas');
-        var ctx = canvas.getContext('2d');
-        var img = new Image();
-        href = href || image.getAttribute('href');
-        img.src = href;
-        img.onload = function() {
-          canvas.width = img.width;
-          canvas.height = img.height;
-          ctx.drawImage(img, 0, 0);
-          image.setAttributeNS("http://www.w3.org/1999/xlink", "href", canvas.toDataURL('image/png'));
-          left--;
-          if (left == 0) {
-            callback();
-          }
-        }
-        img.onerror = function() {
-          console.log("Could not load "+href);
-          left--;
-          if (left == 0) {
-            callback();
-          }
-        }
-      })(images[i]);
+      loadImages(images[i]);
     }
   }
 
   function styles(el, selectorRemap) {
-    var css = "";
+    var css = '';
     var sheets = document.styleSheets;
-    for (var i = 0; i < sheets.length; i++) {
-      if (isExternal(sheets[i].href)) {
-        console.warn("Cannot include styles from other hosts: "+sheets[i].href);
-        continue;
+    function getSheet(sheets, index) {
+      if (isExternal(sheets[index].href)) {
+        console.warn('Cannot include styles from other hosts: ' + sheets[index].href);
+        //continue;
       }
-      var rules = sheets[i].cssRules;
+      var rules = sheets[index].cssRules;
+      function matchCSSRules(rules, j) {
+        var rule = rules[j];
+        if (typeof(rule.style) != 'undefined') {
+          var match = null;
+          try {
+            match = el.querySelector(rule.selectorText);
+          } catch (err) {
+            console.warn('Invalid CSS selector "' + rule.selectorText + '"', err);
+          }
+          if (match) {
+            var selector = selectorRemap ? selectorRemap(rule.selectorText) : rule.selectorText;
+            css += selector + ' { ' + rule.style.cssText + ' }\n';
+          } else if (rule.cssText.match(/^@font-face/)) {
+            inlineFont(rule, function(fontCssText) {
+              // add inlined font rule to resulting CSS
+              css += fontCssText + '\n';
+            });
+          }
+        }
+      }
       if (rules != null) {
         for (var j = 0; j < rules.length; j++) {
+<<<<<<< HEAD
           var rule = rules[j];
           if (typeof(rule.style) != "undefined") {
             var match = null;
@@ -162,82 +282,72 @@
               });
             }
           }
+=======
+          matchCSSRules(rules, j);
+>>>>>>> af3521b1222350858d2e91647426140396282365
         }
       }
     }
+    for (var i = 0; i < sheets.length; i++) {
+      getSheet(sheets, i);
+    }
     return css;
-  }
-
-  function getDimension(el, clone, dim) {
-    return (clone.getAttribute(dim) !== null && !clone.getAttribute(dim).match(/%$/) && parseInt(clone.getAttribute(dim))) ||
-      el.getBoundingClientRect()[dim] ||
-      parseInt(clone.style[dim]) ||
-      parseInt(window.getComputedStyle(el).getPropertyValue(dim));
   }
 
   out$.svgAsDataUri = function(el, options, cb) {
     options = options || {};
     options.scale = options.scale || 1;
-    var xmlns = "http://www.w3.org/2000/xmlns/";
+    var xmlns = 'http://www.w3.org/2000/xmlns/';
+    var svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
+    var box;
 
     inlineImages(el, function() {
-      var outer = document.createElement("div");
+      var outer = document.createElement('div');
       var clone = el.cloneNode(true);
-      var width, height, viewBoxWidth, viewBoxHeight;
-      if(el.tagName == 'svg') {
-        width = getDimension(el, clone, 'width');
-        height = getDimension(el, clone, 'height');
-        if (typeof width === "undefined" || width === null || isNaN(parseFloat(width))) {
-          width = 0;
-        }
-        if (typeof height === "undefined" || height === null || isNaN(parseFloat(height))) {
-          height = 0;
-        }
-        viewBoxWidth = el.viewBox.baseVal && el.viewBox.baseVal.width !== 0 ? el.viewBox.baseVal.width : width;
-        viewBoxHeight = el.viewBox.baseVal && el.viewBox.baseVal.height !== 0 ? el.viewBox.baseVal.height : height;
+      var width;
+      var height;
+      if (el.tagName == 'svg') {
+        box = el.getBoundingClientRect();
+        width = box.width;
+        height = box.height;
       } else {
-        var box = el.getBBox();
+        box = el.getBBox();
         width = box.x + box.width;
         height = box.y + box.height;
         clone.setAttribute('transform', clone.getAttribute('transform').replace(/translate\(.*?\)/, ''));
-        viewBoxWidth = width;
-        viewBoxHeight =  height;
-
-        var svg = document.createElementNS('http://www.w3.org/2000/svg','svg')
-        svg.appendChild(clone)
+        svg.appendChild(clone);
         clone = svg;
       }
 
-      clone.setAttribute("version", "1.1");
-      clone.setAttributeNS(xmlns, "xmlns", "http://www.w3.org/2000/svg");
-      clone.setAttributeNS(xmlns, "xmlns:xlink", "http://www.w3.org/1999/xlink");
-      clone.setAttribute("width", width * options.scale);
-      clone.setAttribute("height", height * options.scale);
-      clone.setAttribute("viewBox", "0 0 " + viewBoxWidth + " " + viewBoxHeight);
-
+      clone.setAttribute('version', '1.1');
+      clone.setAttributeNS(xmlns, 'xmlns', 'http://www.w3.org/2000/svg');
+      clone.setAttributeNS(xmlns, 'xmlns:xlink', 'http://www.w3.org/1999/xlink');
+      clone.setAttribute('width', width * options.scale);
+      clone.setAttribute('height', height * options.scale);
+      clone.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
       outer.appendChild(clone);
 
       var css = styles(el, options.selectorRemap);
       var s = document.createElement('style');
       s.setAttribute('type', 'text/css');
-      s.innerHTML = "<![CDATA[\n" + css + "\n]]>";
+      s.innerHTML = '<![CDATA[\n' + css + '\n]]>';
       var defs = document.createElement('defs');
       defs.appendChild(s);
       clone.insertBefore(defs, clone.firstChild);
 
-      var svg = doctype + outer.innerHTML;
-      // encode then decode to handle `btoa` on Unicode; see MDN for `btoa`.
-      var uri = 'data:image/svg+xml;base64,' + window.btoa(decodeURIComponent(encodeURIComponent(svg)));
+      svg = doctype + outer.innerHTML;
+      var uri = 'data:image/svg+xml;base64,' + window.btoa(unescape(encodeURIComponent(svg)));
       if (cb) {
         cb(uri);
       }
     });
-  }
+  };
 
   out$.saveSvgAsPng = function(el, name, options) {
     options = options || {};
     out$.svgAsDataUri(el, options, function(uri) {
       var image = new Image();
+      image.src = uri;
       image.onload = function() {
         var canvas = document.createElement('canvas');
         canvas.width = image.width;
@@ -249,12 +359,12 @@
         a.download = name;
         a.href = canvas.toDataURL('image/png');
         document.body.appendChild(a);
-        a.addEventListener("click", function(e) {
+        a.addEventListener('click', function(e) {
           a.parentNode.removeChild(a);
         });
+
         a.click();
-      }
-      image.src = uri;
+      };
     });
-  }
+  };
 })();
